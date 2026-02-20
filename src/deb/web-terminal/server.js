@@ -14,10 +14,41 @@ const { config } = JSON.parse(
 	execSync(`${process.env.HESTIA}/bin/v-list-sys-config json`, { silent: true }).toString(),
 );
 
+
+function extractSessionID(cookieHeader) {
+	if (!cookieHeader) return null;
+	const match = cookieHeader.match(new RegExp(`${sessionName}=([^;]+)`));
+	return match ? match[1] : null;
+}
+
+function isValidSessionID(id) {
+	return typeof id === 'string' && /^[a-zA-Z0-9,-]{22,256}$/.test(id);
+}
+
+function parsePhpSession(raw) {
+	const result = {};
+	const regex = /([a-zA-Z_]+)\|s:(\d+):"([^"]*)"/g;
+	let match;
+	while ((match = regex.exec(raw)) !== null) {
+		const [, key, declaredLen, value] = match;
+		if (parseInt(declaredLen, 10) === Buffer.byteLength(value)) {
+			result[key] = value;
+		}
+	}
+	return result;
+}
+
+function isValidUnixUsername(name) {
+	return typeof name === 'string' && /^[a-z_][a-z0-9_-]{0,31}$/.test(name);
+}
+
 const wss = new WebSocketServer({
-	port: Number.parseInt(config.WEB_TERMINAL_PORT, 10),
-	verifyClient: async (info, cb) => {
-		if (!info.req.headers.cookie.includes(sessionName)) {
+	port: parseInt(config.WEB_TERMINAL_PORT, 10),
+	verifyClient: (info, cb) => {
+		const cookie = info.req.headers.cookie;
+		const sessionID = extractSessionID(cookie);
+
+		if (!sessionID || !isValidSessionID(sessionID)) {
 			cb(false, 401, 'Unauthorized');
 			return;
 		}
@@ -43,28 +74,41 @@ const wss = new WebSocketServer({
 });
 
 wss.on('connection', (ws, req) => {
-	wss.clients.add(ws);
-
 	const remoteIP = req.headers['x-real-ip'] || req.socket.remoteAddress;
 
-	// Check if session is valid
-	const sessionID = req.headers.cookie.split(`${sessionName}=`)[1].split(';')[0];
+	const sessionID = extractSessionID(req.headers.cookie);
+	if (!sessionID || !isValidSessionID(sessionID)) {
+		ws.close(1000, 'Invalid session.');
+		return;
+	}
 	console.log(`New connection from ${remoteIP} (${sessionID})`);
 
-	const file = readFileSync(`${process.env.HESTIA}/data/sessions/sess_${sessionID}`);
-	if (!file) {
+	let session;
+	try {
+		const file = readFileSync(`${process.env.HESTIA}/data/sessions/sess_${sessionID}`);
+		session = parsePhpSession(file.toString());
+	} catch {
 		console.error(`Invalid session ID ${sessionID}, refusing connection`);
 		ws.close(1000, 'Your session has expired.');
 		return;
 	}
-	const session = file.toString();
 
-	// Get username
-	const login = session.split('user|s:')[1].split('"')[1];
-	const impersonating = session.split('look|s:')[1].split('"')[1];
+	if (!session.user) {
+		console.error(`Malformed session ${sessionID}`);
+		ws.close(1000, 'Invalid session data.');
+		return;
+	}
+
+	const login = session.user;
+	const impersonating = session.look || '';
 	const username = impersonating.length > 0 ? impersonating : login;
 
-	// Get user info
+	if (!isValidUnixUsername(username)) {
+		console.error(`Invalid username "${username}", refusing connection`);
+		ws.close(1000, 'Invalid user.');
+		return;
+	}
+
 	const passwd = readFileSync('/etc/passwd').toString();
 	const userline = passwd.split('\n').find((line) => line.startsWith(`${username}:`));
 	if (!userline) {
@@ -74,17 +118,22 @@ wss.on('connection', (ws, req) => {
 	}
 	const [, , uid, gid, , homedir, shell] = userline.split(':');
 
+	if (parseInt(uid, 10) === 0) {
+		console.error(`Root shell refused for session ${sessionID}`);
+		ws.close(1000, 'Root terminal access is not allowed.');
+		return;
+	}
+
 	if (shell.endsWith('nologin')) {
 		console.error(`User ${username} has no shell, refusing connection`);
 		ws.close(1000, 'You have no shell access.');
 		return;
 	}
 
-	// Spawn shell as logged in user
 	const pty = spawn(shell, [], {
 		name: 'xterm-color',
-		uid: Number.parseInt(uid, 10),
-		gid: Number.parseInt(gid, 10),
+		uid: parseInt(uid, 10),
+		gid: parseInt(gid, 10),
 		cwd: homedir,
 		env: {
 			SHELL: shell,
@@ -97,20 +146,22 @@ wss.on('connection', (ws, req) => {
 	});
 	console.log(`New pty (${pty.pid}): ${shell} as ${username} (${uid}:${gid}) in ${homedir}`);
 
-	// Send/receive data from websocket/pty
 	pty.on('data', (data) => ws.send(data));
-	ws.on('message', (data) => pty.write(data));
 
-	// Ensure pty is killed when websocket is closed and vice versa
+	ws.on('message', (data) => {
+		if (data.length > 4096) return;
+		pty.write(data);
+	});
+
 	pty.on('exit', () => {
 		console.log(`Ended pty (${pty.pid})`);
-		if (ws.OPEN) {
+		if (ws.readyState === ws.OPEN) {
 			ws.close();
 		}
 	});
+
 	ws.on('close', () => {
 		console.log(`Ended connection from ${remoteIP} (${sessionID})`);
 		pty.kill();
-		wss.clients.delete(ws);
 	});
 });
