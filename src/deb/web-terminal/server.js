@@ -14,7 +14,6 @@ const { config } = JSON.parse(
 	execSync(`${process.env.HESTIA}/bin/v-list-sys-config json`, { silent: true }).toString(),
 );
 
-
 function extractSessionID(cookieHeader) {
 	if (!cookieHeader) return null;
 	const match = cookieHeader.match(new RegExp(`${sessionName}=([^;]+)`));
@@ -78,7 +77,7 @@ wss.on('connection', (ws, req) => {
 
 	const sessionID = extractSessionID(req.headers.cookie);
 	if (!sessionID || !isValidSessionID(sessionID)) {
-		ws.close(1000, 'Invalid session.');
+		ws.close(1000, 'Connection refused.');
 		return;
 	}
 	console.log(`New connection from ${remoteIP} (${sessionID})`);
@@ -89,13 +88,13 @@ wss.on('connection', (ws, req) => {
 		session = parsePhpSession(file.toString());
 	} catch {
 		console.error(`Invalid session ID ${sessionID}, refusing connection`);
-		ws.close(1000, 'Your session has expired.');
+		ws.close(1000, 'Connection refused.');
 		return;
 	}
 
 	if (!session.user) {
 		console.error(`Malformed session ${sessionID}`);
-		ws.close(1000, 'Invalid session data.');
+		ws.close(1000, 'Connection refused.');
 		return;
 	}
 
@@ -105,7 +104,7 @@ wss.on('connection', (ws, req) => {
 
 	if (!isValidUnixUsername(username)) {
 		console.error(`Invalid username "${username}", refusing connection`);
-		ws.close(1000, 'Invalid user.');
+		ws.close(1000, 'Connection refused.');
 		return;
 	}
 
@@ -113,20 +112,20 @@ wss.on('connection', (ws, req) => {
 	const userline = passwd.split('\n').find((line) => line.startsWith(`${username}:`));
 	if (!userline) {
 		console.error(`User ${username} not found, refusing connection`);
-		ws.close(1000, 'You are not allowed to access this server.');
+		ws.close(1000, 'Connection refused.');
 		return;
 	}
 	const [, , uid, gid, , homedir, shell] = userline.split(':');
 
 	if (parseInt(uid, 10) === 0) {
 		console.error(`Root shell refused for session ${sessionID}`);
-		ws.close(1000, 'Root terminal access is not allowed.');
+		ws.close(1000, 'Connection refused.');
 		return;
 	}
 
 	if (shell.endsWith('nologin')) {
 		console.error(`User ${username} has no shell, refusing connection`);
-		ws.close(1000, 'You have no shell access.');
+		ws.close(1000, 'Connection refused.');
 		return;
 	}
 
