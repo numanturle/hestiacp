@@ -26,15 +26,58 @@ function isValidSessionID(id) {
 
 function parsePhpSession(raw) {
 	const result = {};
-	const regex = /([a-zA-Z_]+)\|s:(\d+):"([^"]*)"/g;
-	let match;
-	while ((match = regex.exec(raw)) !== null) {
-		const [, key, declaredLen, value] = match;
-		if (parseInt(declaredLen, 10) === Buffer.byteLength(value)) {
+	const buf = Buffer.from(raw);
+	let pos = 0;
+
+	while (pos < buf.length) {
+		const pipeIndex = buf.indexOf(0x7c, pos);
+		if (pipeIndex === -1) break;
+
+		const key = buf.subarray(pos, pipeIndex).toString();
+		pos = pipeIndex + 1;
+
+		if (buf[pos] !== 0x73 || buf[pos + 1] !== 0x3a) {
+			const nextKey = findNextKey(buf, pos);
+			if (nextKey === -1) break;
+			pos = nextKey;
+			continue;
+		}
+
+		pos += 2;
+
+		const quoteStart = buf.indexOf(0x3a, pos);
+		if (quoteStart === -1) break;
+		const declaredLen = parseInt(buf.subarray(pos, quoteStart).toString(), 10);
+		if (isNaN(declaredLen) || declaredLen < 0 || declaredLen > 65535) break;
+
+		pos = quoteStart + 1;
+
+		if (buf[pos] !== 0x22) break;
+		pos += 1;
+
+		if (pos + declaredLen > buf.length) break;
+		const value = buf.subarray(pos, pos + declaredLen).toString();
+		pos += declaredLen;
+
+		if (buf[pos] !== 0x22 || buf[pos + 1] !== 0x3b) break;
+		pos += 2;
+
+		if (key === 'user' || key === 'look') {
 			result[key] = value;
 		}
 	}
+
 	return result;
+}
+
+function findNextKey(buf, pos) {
+	while (pos < buf.length) {
+		if (buf[pos] === 0x3b) {
+			return pos + 1;
+		}
+		pos++;
+	}
+	return -1;
 }
 
 function isValidUnixUsername(name) {
